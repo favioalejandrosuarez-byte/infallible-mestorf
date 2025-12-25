@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Liquidity Hunter Pro - Favio</title>
+    <style>
+      :root {
+        --bg: #05060b;
+        --header: #0c0e16;
+        --up: #00ffaa;
+        --down: #ff3e3e;
+        --text: #d1d4dc;
+        --crosshair: rgba(255, 255, 255, 0.3);
+      }
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        margin: 0;
+        font-family: "Inter", sans-serif;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+
+      header {
+        background: var(--header);
+        padding: 10px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid #1f2330;
+        user-select: none;
+      }
+
+      .btn-group {
+        display: flex;
+        gap: 2px;
+        background: #111;
+        padding: 2px;
+        border-radius: 4px;
+      }
+      button {
+        background: transparent;
+        border: none;
+        color: #666;
+        padding: 6px 12px;
+        cursor: pointer;
+        font-weight: 700;
+        font-size: 11px;
+        border-radius: 4px;
+        transition: 0.2s;
+      }
+      button.active-tf {
+        background: #2962ff;
+        color: white;
+      }
+      button.active-lev {
+        color: white;
+        background: rgba(255, 255, 255, 0.1);
+      }
+
+      #chart-wrapper {
+        flex-grow: 1;
+        display: flex;
+        position: relative;
+        overflow: hidden;
+      }
+      #chart-container {
+        flex-grow: 1;
+        position: relative;
+        cursor: crosshair;
+      }
+
+      /* Optimización Extrema: Columna reducida a 48px según la línea roja */
+      #price-axis {
+        width: 48px;
+        background: var(--header);
+        border-left: 1px solid #1f2330;
+        cursor: ns-resize;
+        position: relative;
+        z-index: 20;
+      }
+
+      canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+      }
+      #heatmapCanvas {
+        mix-blend-mode: screen;
+        opacity: 0.9;
+      }
+      .price-tag {
+        font-size: 24px;
+        font-weight: 800;
+      }
+      .loading-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--bg);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 100;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div style="display: flex; gap: 15px">
+        <div class="btn-group">
+          <button onclick="setTF('15m', this)">15M</button>
+          <button class="active-tf" onclick="setTF('1h', this)">1H</button>
+          <button onclick="setTF('4h', this)">4H</button>
+        </div>
+        <div class="btn-group">
+          <button
+            class="active-lev"
+            onclick="toggleLev(100, this)"
+            style="color: #ff0000"
+          >
+            100x
+          </button>
+          <button
+            class="active-lev"
+            onclick="toggleLev(50, this)"
+            style="color: #ffaa00"
+          >
+            50x
+          </button>
+          <button
+            class="active-lev"
+            onclick="toggleLev(25, this)"
+            style="color: #ffff00"
+          >
+            25x
+          </button>
+          <button
+            class="active-lev"
+            onclick="toggleLev(10, this)"
+            style="color: #0088ff"
+          >
+            10x
+          </button>
+        </div>
+      </div>
+      <div id="price-display" class="price-tag">00,000.0</div>
+      <div style="font-size: 11px; color: #666; text-align: right">
+        Cochabamba: <span id="clock"></span>
+      </div>
+    </header>
+
+    <div id="chart-wrapper">
+      <div id="loading" class="loading-overlay">
+        <div style="color: var(--up); font-weight: bold">
+          SINCRONIZANDO MERCADO...
+        </div>
+      </div>
+      <div id="chart-container">
+        <canvas id="heatmapCanvas"></canvas>
+        <canvas id="candleCanvas"></canvas>
+        <canvas id="interactionCanvas"></canvas>
+      </div>
+      <canvas id="price-axis"></canvas>
+    </div>
+
+    <script>
+      const hCanvas = document.getElementById("heatmapCanvas"),
+        hCtx = hCanvas.getContext("2d");
+      const cCanvas = document.getElementById("candleCanvas"),
+        cCtx = cCanvas.getContext("2d");
+      const iCanvas = document.getElementById("interactionCanvas"),
+        iCtx = iCanvas.getContext("2d");
+      const aCanvas = document.getElementById("price-axis"),
+        aCtx = aCanvas.getContext("2d");
+      const priceDisplay = document.getElementById("price-display");
+
+      let width,
+        height,
+        tf = "1h";
+      let candles = [],
+        densitySnapshots = [];
+      let currentPrice = 0;
+      let levWeights = { 100: 10, 50: 5, 25: 2, 10: 1 };
+      let activeLevs = { 100: true, 50: true, 25: true, 10: true };
+
+      let viewRange = 3000,
+        priceOffset = 0,
+        lastY = 0,
+        isDraggingAxis = false;
+      let visibleCandles = 150;
+      let mousePos = { x: 0, y: 0 };
+      const BUCKET_SIZE = 10;
+
+      function resize() {
+        width =
+          hCanvas.width =
+          cCanvas.width =
+          iCanvas.width =
+            document.getElementById("chart-container").clientWidth;
+        height =
+          hCanvas.height =
+          cCanvas.height =
+          iCanvas.height =
+          aCanvas.height =
+            document.getElementById("chart-container").clientHeight;
+        aCanvas.width = 48; // Ancho mínimo para ocupar lo menos posible
+        render();
+      }
+      window.onresize = resize;
+
+      async function initData() {
+        document.getElementById("loading").style.display = "flex";
+        const kRes = await fetch(
+          `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=${tf}&limit=500`
+        );
+        const data = await kRes.json();
+        candles = data.map((k) => ({
+          o: parseFloat(k[1]),
+          h: parseFloat(k[2]),
+          l: parseFloat(k[3]),
+          c: parseFloat(k[4]),
+        }));
+        currentPrice = candles[candles.length - 1].c;
+        priceOffset = currentPrice;
+        generateDensityMap();
+        document.getElementById("loading").style.display = "none";
+        resize();
+        startSockets();
+      }
+
+      function generateDensityMap() {
+        densitySnapshots = [];
+        let pivotPoints = [];
+        for (let i = 5; i < candles.length - 1; i++) {
+          const isHigh =
+            candles[i].h > candles[i - 1].h && candles[i].h > candles[i + 1].h;
+          const isLow =
+            candles[i].l < candles[i - 1].l && candles[i].l < candles[i + 1].l;
+          if (isHigh || isLow)
+            pivotPoints.push({
+              price: isHigh ? candles[i].h : candles[i].l,
+              type: isHigh ? "high" : "low",
+            });
+        }
+
+        let heatMap = {};
+        candles.forEach((c) => {
+          pivotPoints.forEach((p) => {
+            [100, 50, 25, 10].forEach((lev) => {
+              if (!activeLevs[lev]) return;
+              const liqPrice =
+                p.type === "high"
+                  ? p.price * (1 + 1 / lev)
+                  : p.price * (1 - 1 / lev);
+              const bucket = Math.floor(liqPrice / BUCKET_SIZE) * BUCKET_SIZE;
+              if (!heatMap[bucket]) heatMap[bucket] = 0;
+              heatMap[bucket] += levWeights[lev] * 0.05;
+            });
+          });
+          for (let b in heatMap) {
+            if (c.h >= parseFloat(b) && c.l <= parseFloat(b) + BUCKET_SIZE) {
+              heatMap[b] *= 0.5;
+              if (heatMap[b] < 0.5) delete heatMap[b];
+            }
+          }
+          let maxInt = Math.max(1, ...Object.values(heatMap));
+          densitySnapshots.push(
+            Object.entries(heatMap).map(([p, int]) => ({
+              p: parseFloat(p),
+              intensity: Math.min(int / maxInt, 1),
+            }))
+          );
+        });
+      }
+
+      function getHeatColor(intensity) {
+        const hue = (1 - intensity) * 240;
+        return `hsl(${hue}, 100%, ${40 + intensity * 20}%)`;
+      }
+
+      const getY = (p) => height / 2 - (p - priceOffset) * (height / viewRange);
+      const getPrice = (y) =>
+        (height / 2 - y) * (viewRange / height) + priceOffset;
+
+      function render() {
+        hCtx.clearRect(0, 0, width, height);
+        cCtx.clearRect(0, 0, width, height);
+
+        const candleW = width / (visibleCandles - 1);
+        const startIdx = Math.max(0, candles.length - visibleCandles);
+        const activeCandles = candles.slice(startIdx);
+        const activeSnapshots = densitySnapshots.slice(startIdx);
+
+        hCtx.globalCompositeOperation = "lighter";
+        activeSnapshots.forEach((snap, i) => {
+          const x = i * candleW;
+          snap.forEach((pool) => {
+            if (pool.intensity > 0.05) {
+              hCtx.fillStyle = getHeatColor(pool.intensity);
+              const y1 = getY(pool.p),
+                y2 = getY(pool.p + BUCKET_SIZE);
+              hCtx.fillRect(x, y2, candleW + 1, y1 - y2);
+            }
+          });
+        });
+        hCtx.globalCompositeOperation = "source-over";
+
+        activeCandles.forEach((c, i) => {
+          const x = i * candleW;
+          cCtx.fillStyle = cCtx.strokeStyle =
+            c.c >= c.o ? "#00ffaa" : "#ff3e3e";
+          cCtx.beginPath();
+          cCtx.moveTo(x, getY(c.h));
+          cCtx.lineTo(x, getY(c.l));
+          cCtx.stroke();
+          const bodyW = candleW * 0.7;
+          cCtx.fillRect(
+            x - bodyW / 2,
+            Math.min(getY(c.o), getY(c.c)),
+            bodyW,
+            Math.max(1, Math.abs(getY(c.o) - getY(c.c)))
+          );
+        });
+
+        drawAxis();
+        drawInteraction();
+      }
+
+      function drawInteraction() {
+        iCtx.clearRect(0, 0, width, height);
+        if (mousePos.y > 0) {
+          iCtx.strokeStyle = "rgba(255,255,255,0.2)";
+          iCtx.setLineDash([5, 5]);
+          iCtx.beginPath();
+          iCtx.moveTo(0, mousePos.y);
+          iCtx.lineTo(width, mousePos.y);
+          iCtx.stroke();
+          iCtx.setLineDash([]);
+          const p = getPrice(mousePos.y);
+          drawPriceLabel(aCtx, p, mousePos.y, "#444");
+        }
+      }
+
+      // Ajuste: Reducido a 1 decimal para ocupar el mínimo espacio posible
+      function drawPriceLabel(ctx, price, y, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(0, y - 9, 48, 18);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 9px Arial";
+        ctx.fillText(
+          price.toLocaleString(undefined, {
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1,
+          }),
+          2,
+          y + 4
+        );
+      }
+
+      function drawAxis() {
+        aCtx.fillStyle = "#0c0e16";
+        aCtx.fillRect(0, 0, 48, height);
+        aCtx.fillStyle = "#aaa";
+        aCtx.font = "9px Arial";
+        const step = Math.pow(10, Math.floor(Math.log10(viewRange / 5)));
+        const minY = getPrice(height),
+          maxY = getPrice(0);
+        for (let p = Math.ceil(minY / step) * step; p < maxY; p += step) {
+          const y = getY(p);
+          // Escala de fondo con 0 decimales para limpieza total
+          aCtx.fillText(
+            p.toLocaleString(undefined, { maximumFractionDigits: 0 }),
+            2,
+            y + 4
+          );
+        }
+        drawPriceLabel(
+          aCtx,
+          currentPrice,
+          getY(currentPrice),
+          currentPrice >= candles[candles.length - 1].o ? "#00ffaa" : "#ff3e3e"
+        );
+      }
+
+      document.getElementById("chart-container").onmousemove = (e) => {
+        const rect = e.target.getBoundingClientRect();
+        mousePos.x = e.clientX - rect.left;
+        mousePos.y = e.clientY - rect.top;
+        drawInteraction();
+      };
+
+      document.getElementById("chart-container").onwheel = (e) => {
+        e.preventDefault();
+        if (e.deltaY > 0) visibleCandles = Math.min(500, visibleCandles + 10);
+        else visibleCandles = Math.max(20, visibleCandles - 10);
+        render();
+      };
+
+      aCanvas.onmousedown = (e) => {
+        isDraggingAxis = true;
+        lastY = e.clientY;
+      };
+      window.onmousemove = (e) => {
+        if (isDraggingAxis) {
+          viewRange += (e.clientY - lastY) * (viewRange / 150);
+          lastY = e.clientY;
+          render();
+        }
+      };
+      window.onmouseup = () => (isDraggingAxis = false);
+
+      function setTF(newTf, btn) {
+        tf = newTf;
+        document
+          .querySelectorAll(".active-tf")
+          .forEach((b) => b.classList.remove("active-tf"));
+        btn.classList.add("active-tf");
+        initData();
+      }
+
+      function toggleLev(lev, btn) {
+        activeLevs[lev] = !activeLevs[lev];
+        btn.classList.toggle("active-lev");
+        generateDensityMap();
+        render();
+      }
+
+      function startSockets() {
+        const wsK = new WebSocket(
+          `wss://fstream.binance.com/ws/btcusdt@kline_${tf}`
+        );
+        wsK.onmessage = (e) => {
+          const k = JSON.parse(e.data).k;
+          const c = {
+            o: parseFloat(k.o),
+            h: parseFloat(k.h),
+            l: parseFloat(k.l),
+            c: parseFloat(k.c),
+          };
+          currentPrice = c.c;
+          priceDisplay.innerText = currentPrice.toLocaleString(undefined, {
+            minimumFractionDigits: 1,
+            maximumFractionDigits: 1,
+          });
+          if (k.x) {
+            candles.shift();
+            candles.push(c);
+            generateDensityMap();
+          } else {
+            candles[candles.length - 1] = c;
+          }
+          render();
+        };
+      }
+
+      setInterval(() => {
+        document.getElementById("clock").innerText =
+          new Date().toLocaleTimeString();
+      }, 1000);
+      initData();
+    </script>
+  </body>
+</html>
